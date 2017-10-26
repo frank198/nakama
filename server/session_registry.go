@@ -17,6 +17,7 @@ package server
 import (
 	"sync"
 
+	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gorilla/websocket"
 	"github.com/satori/go.uuid"
 	"go.uber.org/zap"
@@ -67,8 +68,9 @@ func (a *SessionRegistry) Get(sessionID uuid.UUID) *session {
 	return s
 }
 
-func (a *SessionRegistry) add(userID uuid.UUID, handle string, lang string, expiry int64, conn *websocket.Conn, processRequest func(logger *zap.Logger, session *session, envelope *Envelope)) {
-	s := NewSession(a.logger, a.config, userID, handle, lang, expiry, conn, a.remove)
+func (a *SessionRegistry) add(userID uuid.UUID, handle string, lang string, format sessionFormat, expiry int64, conn *websocket.Conn, jsonpbMarshaler *jsonpb.Marshaler,
+	jsonpbUnmarshaler *jsonpb.Unmarshaler, processRequest func(logger *zap.Logger, session *session, envelope *Envelope)) {
+	s := NewSession(a.logger, a.config, userID, handle, lang, format, expiry, conn, jsonpbMarshaler, jsonpbUnmarshaler, a.remove)
 	a.Lock()
 	a.sessions[s.id] = s
 	a.Unlock()

@@ -24,46 +24,63 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/satori/go.uuid"
 
+	"bytes"
+
+	"github.com/gogo/protobuf/jsonpb"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
+type sessionFormat int
+
+const (
+	sessionProtobuf sessionFormat = 0
+	sessionJson                   = 1
+)
+
 type session struct {
 	sync.Mutex
-	logger           *zap.Logger
-	config           Config
-	id               uuid.UUID
-	userID           uuid.UUID
-	handle           *atomic.String
-	lang             string
-	expiry           int64
-	stopped          bool
-	conn             *websocket.Conn
-	pingTicker       *time.Ticker
-	pingTickerStopCh chan (bool)
-	unregister       func(s *session)
+	logger            *zap.Logger
+	config            Config
+	id                uuid.UUID
+	userID            uuid.UUID
+	handle            *atomic.String
+	lang              string
+	format            sessionFormat
+	expiry            int64
+	stopped           bool
+	conn              *websocket.Conn
+	jsonpbMarshaler   *jsonpb.Marshaler
+	jsonpbUnmarshaler *jsonpb.Unmarshaler
+	pingTicker        *time.Ticker
+	pingTickerStopCh  chan (bool)
+	unregister        func(s *session)
 }
 
 // NewSession creates a new session which encapsulates a socket connection
-func NewSession(logger *zap.Logger, config Config, userID uuid.UUID, handle string, lang string, expiry int64, websocketConn *websocket.Conn, unregister func(s *session)) *session {
+func NewSession(logger *zap.Logger, config Config, userID uuid.UUID, handle string, lang string, format sessionFormat, expiry int64, websocketConn *websocket.Conn, jsonpbMarshaler *jsonpb.Marshaler,
+	jsonpbUnmarshaler *jsonpb.Unmarshaler, unregister func(s *session)) *session {
 	sessionID := uuid.NewV4()
 	sessionLogger := logger.With(zap.String("uid", userID.String()), zap.String("sid", sessionID.String()))
 
 	sessionLogger.Info("New session connected")
 
 	return &session{
-		logger:           sessionLogger,
-		config:           config,
-		id:               sessionID,
-		userID:           userID,
-		handle:           atomic.NewString(handle),
-		lang:             lang,
-		expiry:           expiry,
-		conn:             websocketConn,
-		stopped:          false,
-		pingTicker:       time.NewTicker(time.Duration(config.GetSocket().PingPeriodMs) * time.Millisecond),
-		pingTickerStopCh: make(chan bool),
-		unregister:       unregister,
+		logger:            sessionLogger,
+		config:            config,
+		id:                sessionID,
+		userID:            userID,
+		handle:            atomic.NewString(handle),
+		lang:              lang,
+		format:            format,
+		expiry:            expiry,
+		conn:              websocketConn,
+		jsonpbMarshaler:   jsonpbMarshaler,
+		jsonpbUnmarshaler: jsonpbUnmarshaler,
+		stopped:           false,
+		pingTicker:        time.NewTicker(time.Duration(config.GetSocket().PingPeriodMs) * time.Millisecond),
+		pingTickerStopCh:  make(chan bool),
+		unregister:        unregister,
 	}
 }
 
@@ -90,7 +107,13 @@ func (s *session) Consume(processRequest func(logger *zap.Logger, session *sessi
 		}
 
 		request := &Envelope{}
-		err = proto.Unmarshal(data, request)
+		switch s.format {
+		case sessionJson:
+			err = s.jsonpbUnmarshaler.Unmarshal(bytes.NewReader(data), request)
+		default:
+			err = proto.Unmarshal(data, request)
+		}
+
 		if err != nil {
 			s.logger.Warn("Received malformed payload", zap.Any("data", data))
 			s.Send(ErrorMessage(request.CollationId, UNRECOGNIZED_PAYLOAD, "Unrecognized payload"))
@@ -142,19 +165,29 @@ func (s *session) pingNow() bool {
 
 func (s *session) Send(envelope *Envelope) error {
 	s.logger.Debug(fmt.Sprintf("Sending %T message", envelope.Payload), zap.String("cid", envelope.CollationId))
-
-	payload, err := proto.Marshal(envelope)
-
-	if err != nil {
-		s.logger.Warn("Could not marshall Response to byte[]", zap.Error(err))
-		return err
-	}
-
-	return s.SendBytes(payload)
+	return s.SendMessage(envelope)
 }
 
-func (s *session) SendBytes(payload []byte) error {
-	// TODO Improve on mutex usage here.
+func (s *session) SendMessage(msg proto.Message) error {
+	switch s.format {
+	case sessionJson:
+		payload, err := s.jsonpbMarshaler.MarshalToString(msg)
+		if err != nil {
+			s.logger.Warn("Could not marshall Response to json", zap.Error(err))
+			return err
+		}
+		return s.sendText(payload)
+	default:
+		payload, err := proto.Marshal(msg)
+		if err != nil {
+			s.logger.Warn("Could not marshall Response to byte[]", zap.Error(err))
+			return err
+		}
+		return s.sendBytes(payload)
+	}
+}
+
+func (s *session) sendBytes(payload []byte) error {
 	s.Lock()
 	defer s.Unlock()
 	if s.stopped {
@@ -164,8 +197,23 @@ func (s *session) SendBytes(payload []byte) error {
 	s.conn.SetWriteDeadline(time.Now().Add(time.Duration(s.config.GetSocket().WriteWaitMs) * time.Millisecond))
 	err := s.conn.WriteMessage(websocket.BinaryMessage, payload)
 	if err != nil {
-		s.logger.Warn("Could not write message", zap.Error(err))
-		//TODO investigate whether we need to cleanupClosedConnection if write fails
+		s.logger.Warn("Could not write binary message", zap.Error(err))
+	}
+
+	return err
+}
+
+func (s *session) sendText(payload string) error {
+	s.Lock()
+	defer s.Unlock()
+	if s.stopped {
+		return nil
+	}
+
+	s.conn.SetWriteDeadline(time.Now().Add(time.Duration(s.config.GetSocket().WriteWaitMs) * time.Millisecond))
+	err := s.conn.WriteMessage(websocket.TextMessage, []byte(payload))
+	if err != nil {
+		s.logger.Warn("Could not write text message", zap.Error(err))
 	}
 
 	return err
